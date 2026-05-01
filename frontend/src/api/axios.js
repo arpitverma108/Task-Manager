@@ -1,14 +1,19 @@
 import axios from 'axios';
 
+// In development: VITE_API_URL is empty, Vite proxy handles /api → localhost:5000
+// In production (Vercel): set VITE_API_URL to your Railway backend URL
 const BASE_URL = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL}/api`
   : '/api';
 
-const api = axios.create({ baseURL: BASE_URL,
-  withCredentials: true
- });
+const api = axios.create({
+  baseURL: BASE_URL,
+  // ✅ FIX: Must be false. This app uses JWT via Authorization header, NOT cookies.
+  // withCredentials:true + non-wildcard CORS origin causes browsers to block all requests.
+  withCredentials: false,
+});
 
-// Attach JWT to every request automatically
+// Attach JWT token to every request automatically
 api.interceptors.request.use(config => {
   const token = localStorage.getItem('ttm_token');
   if (token) config.headers.Authorization = `Bearer ${token}`;
