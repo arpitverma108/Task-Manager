@@ -4,8 +4,9 @@ const { getDb } = require('../config/db');
 /**
  * Middleware: Verifies the JWT from the Authorization header.
  * Attaches the decoded user object to req.user.
+ * Must be async because pg queries are async.
  */
-function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ message: 'No token provided. Please log in.' });
@@ -15,9 +16,8 @@ function authenticate(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Fetch fresh user from DB to catch role changes / deletions
     const db = getDb();
-    const user = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(decoded.id);
+    const user = await db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(decoded.id);
     if (!user) {
       return res.status(401).json({ message: 'User no longer exists.' });
     }
