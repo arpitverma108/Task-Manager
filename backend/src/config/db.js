@@ -1,63 +1,47 @@
 /**
  * db.js — PostgreSQL via the 'pg' package
  *
- * Reads DATABASE_URL from environment (Railway provides this automatically
- * when you attach a Postgres plugin to your service).
- *
- * Exports:
- *   initializeDb()  — call once at startup; creates tables if they don't exist
- *   getDb()         — returns a helper with .prepare(sql) that mirrors the
- *                     old better-sqlite3 / sql.js sync API, but uses async
- *                     pg queries under the hood via a thin wrapper.
- *
- * NOTE: Because pg is async, all controller functions that call
- * db.prepare(...).get / .all / .run must be async and await the result.
- * The controllers in this migration have been updated accordingly.
+ * Reads DATABASE_URL from environment (Railway injects this automatically
+ * when a Postgres plugin is attached to the service).
  */
 
 const { Pool } = require('pg');
 
 let pool = null;
 
-// ── Pool factory ────────────────────────────────────────────────────────────
+// ── Pool accessor (used by taskController for dynamic queries) ──────────────
 
 function getPool() {
-  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
+  if (!pool) throw new Error('DB not ready — call initializeDb() first.');
   return pool;
 }
 
-// ── Compatibility wrapper ────────────────────────────────────────────────────
-//
-// Returns an object that looks like a better-sqlite3 statement but is async.
-// Usage:  const row  = await db.prepare('SELECT ...').get(val1, val2)
-//         const rows = await db.prepare('SELECT ...').all(val1)
-//         const res  = await db.prepare('INSERT ...').run(val1, val2)
-//
-// PostgreSQL uses $1, $2, … placeholders. We auto-convert ? → $N so the
-// existing SQL strings in the controllers work without modification.
+// ── ? → $N placeholder converter ────────────────────────────────────────────
 
 function convertPlaceholders(sql) {
   let i = 0;
   return sql.replace(/\?/g, () => `$${++i}`);
 }
 
+// ── Compatibility wrapper (mirrors better-sqlite3 sync API, but async) ───────
+
 function makeStatement(sql) {
   const pgSql = convertPlaceholders(sql);
 
   return {
     async get(...params) {
-      const { rows } = await getPool().query(pgSql, params.flat());
+      const { rows } = await pool.query(pgSql, params.flat());
       return rows[0] ?? undefined;
     },
 
     async all(...params) {
-      const { rows } = await getPool().query(pgSql, params.flat());
+      const { rows } = await pool.query(pgSql, params.flat());
       return rows;
     },
 
     async run(...params) {
-      // For INSERT … RETURNING id we detect RETURNING clause; otherwise just execute.
-      const { rows, rowCount } = await getPool().query(pgSql, params.flat());
+      const { rows, rowCount } = await pool.query(pgSql, params.flat());
+      // Supports INSERT … RETURNING id
       const lastInsertRowid = rows[0]?.id ?? null;
       return { lastInsertRowid, changes: rowCount };
     },
@@ -65,29 +49,17 @@ function makeStatement(sql) {
 }
 
 function getDb() {
-  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
+  if (!pool) throw new Error('DB not ready — call initializeDb() first.');
   return {
     prepare: (sql) => makeStatement(sql),
-    // For raw multi-statement exec (schema creation)
-    exec: async (sql) => { await pool.query(sql); },
   };
 }
 
-// ── Initialization ──────────────────────────────────────────────────────────
+// ── Schema setup ─────────────────────────────────────────────────────────────
+// pg cannot execute multiple statements in one query() call, so we run each
+// CREATE TABLE separately.
 
-async function initializeDb() {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('railway')
-      ? { rejectUnauthorized: false }
-      : false,
-  });
-
-  // Smoke-test the connection
-  const client = await pool.connect();
-  client.release();
-
-  // Create schema (idempotent)
+async function createSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id            SERIAL PRIMARY KEY,
@@ -97,22 +69,28 @@ async function initializeDb() {
       role          TEXT    NOT NULL DEFAULT 'member'
                     CHECK(role IN ('admin', 'member')),
       created_at    TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `);
 
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS projects (
       id          SERIAL PRIMARY KEY,
       name        TEXT    NOT NULL,
       description TEXT,
       created_by  INTEGER NOT NULL REFERENCES users(id),
       created_at  TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `);
 
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS project_members (
       project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       user_id     INTEGER NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
       PRIMARY KEY (project_id, user_id)
-    );
+    )
+  `);
 
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id          SERIAL PRIMARY KEY,
       project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -123,15 +101,33 @@ async function initializeDb() {
                   CHECK(status IN ('pending', 'in_progress', 'completed')),
       due_date    DATE,
       created_at  TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
   `);
-
-  console.log('✅ PostgreSQL database ready.');
 }
 
-function getPool() {
-  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
-  return pool;
+// ── Initialization (call once at server startup) ──────────────────────────────
+
+async function initializeDb() {
+  const dbUrl = process.env.DATABASE_URL || '';
+
+  if (!dbUrl) {
+    throw new Error('DATABASE_URL environment variable is not set.');
+  }
+
+  // Internal Railway private networking (*.railway.internal) does NOT use SSL.
+  // Public/external URLs do need SSL.
+  const isInternal = dbUrl.includes('.railway.internal');
+  const ssl = isInternal ? false : { rejectUnauthorized: false };
+
+  pool = new Pool({ connectionString: dbUrl, ssl });
+
+  // Smoke-test
+  const client = await pool.connect();
+  client.release();
+  console.log('✅ Connected to PostgreSQL.');
+
+  await createSchema();
+  console.log('✅ Schema ready.');
 }
 
 module.exports = { getDb, getPool, initializeDb };
