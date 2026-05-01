@@ -1,121 +1,110 @@
 /**
- * db.js — SQLite via sql.js (WebAssembly, zero native compilation)
+ * db.js — PostgreSQL via the 'pg' package
  *
- * Persistence: the DB is loaded from / saved to a binary file on disk.
- * Every write (run / exec) auto-saves the file synchronously.
+ * Reads DATABASE_URL from environment (Railway provides this automatically
+ * when you attach a Postgres plugin to your service).
  *
- * NOTE: sql.js runs entirely in-memory (WASM). WAL journal mode and
- * foreign_keys pragmas are set via exec() which works correctly.
+ * Exports:
+ *   initializeDb()  — call once at startup; creates tables if they don't exist
+ *   getDb()         — returns a helper with .prepare(sql) that mirrors the
+ *                     old better-sqlite3 / sql.js sync API, but uses async
+ *                     pg queries under the hood via a thin wrapper.
+ *
+ * NOTE: Because pg is async, all controller functions that call
+ * db.prepare(...).get / .all / .run must be async and await the result.
+ * The controllers in this migration have been updated accordingly.
  */
 
-const path = require('path');
-const fs   = require('fs');
+const { Pool } = require('pg');
 
-const DB_PATH = process.env.DB_PATH
-  ? path.resolve(process.env.DB_PATH)
-  : path.join(__dirname, '../../data/taskmanager.db');
+let pool = null;
 
-let _raw = null; // raw sql.js Database instance
+// ── Pool factory ────────────────────────────────────────────────────────────
 
-// ── Persistence helpers ────────────────────────────────────────────────────
-
-function ensureDir() {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+function getPool() {
+  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
+  return pool;
 }
 
-function saveToFile() {
-  try {
-    ensureDir();
-    const data = _raw.export();
-    fs.writeFileSync(DB_PATH, Buffer.from(data));
-  } catch (err) {
-    console.error('[db] Failed to persist database to disk:', err);
-    // Don't throw — let the request complete, but log so ops can see it
-  }
-}
+// ── Compatibility wrapper ────────────────────────────────────────────────────
+//
+// Returns an object that looks like a better-sqlite3 statement but is async.
+// Usage:  const row  = await db.prepare('SELECT ...').get(val1, val2)
+//         const rows = await db.prepare('SELECT ...').all(val1)
+//         const res  = await db.prepare('INSERT ...').run(val1, val2)
+//
+// PostgreSQL uses $1, $2, … placeholders. We auto-convert ? → $N so the
+// existing SQL strings in the controllers work without modification.
 
-// ── Compatibility wrapper (mirrors better-sqlite3 sync API) ───────────────
+function convertPlaceholders(sql) {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
 
 function makeStatement(sql) {
+  const pgSql = convertPlaceholders(sql);
+
   return {
-    get(...params) {
-      const stmt = _raw.prepare(sql);
-      if (params.length) stmt.bind(params);
-      const row = stmt.step() ? stmt.getAsObject() : undefined;
-      stmt.free();
-      return row;
+    async get(...params) {
+      const { rows } = await getPool().query(pgSql, params.flat());
+      return rows[0] ?? undefined;
     },
 
-    all(...params) {
-      const stmt = _raw.prepare(sql);
-      if (params.length) stmt.bind(params);
-      const rows = [];
-      while (stmt.step()) rows.push(stmt.getAsObject());
-      stmt.free();
+    async all(...params) {
+      const { rows } = await getPool().query(pgSql, params.flat());
       return rows;
     },
 
-    run(...params) {
-      const stmt = _raw.prepare(sql);
-      if (params.length) stmt.bind(params);
-      stmt.step();
-      stmt.free();
-
-      const idRes = _raw.exec('SELECT last_insert_rowid()');
-      const chRes = _raw.exec('SELECT changes()');
-      const lastInsertRowid = idRes[0]?.values[0][0] ?? 0;
-      const changes         = chRes[0]?.values[0][0] ?? 0;
-
-      saveToFile();
-      return { lastInsertRowid, changes };
+    async run(...params) {
+      // For INSERT … RETURNING id we detect RETURNING clause; otherwise just execute.
+      const { rows, rowCount } = await getPool().query(pgSql, params.flat());
+      const lastInsertRowid = rows[0]?.id ?? null;
+      return { lastInsertRowid, changes: rowCount };
     },
   };
 }
 
 function getDb() {
-  if (!_raw) throw new Error('DB not ready — initializeDb() must be awaited first.');
+  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
   return {
     prepare: (sql) => makeStatement(sql),
-    exec:    (sql) => { _raw.exec(sql); saveToFile(); },
-    pragma:  ()    => {},
+    // For raw multi-statement exec (schema creation)
+    exec: async (sql) => { await pool.query(sql); },
   };
 }
 
-// ── Initialization (async — call once at startup) ──────────────────────────
+// ── Initialization ──────────────────────────────────────────────────────────
 
 async function initializeDb() {
-  const initSqlJs = require('sql.js');
-  const SQL = await initSqlJs();
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('railway')
+      ? { rejectUnauthorized: false }
+      : false,
+  });
 
-  ensureDir();
+  // Smoke-test the connection
+  const client = await pool.connect();
+  client.release();
 
-  if (fs.existsSync(DB_PATH)) {
-    const buf = fs.readFileSync(DB_PATH);
-    _raw = new SQL.Database(buf);
-  } else {
-    _raw = new SQL.Database();
-  }
-
-  // Foreign keys must be set via exec (pragmas work in sql.js this way)
-  _raw.exec('PRAGMA foreign_keys = ON;');
-
-  _raw.exec(`
+  // Create schema (idempotent)
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      id            SERIAL PRIMARY KEY,
       name          TEXT    NOT NULL,
       email         TEXT    NOT NULL UNIQUE,
       password_hash TEXT    NOT NULL,
       role          TEXT    NOT NULL DEFAULT 'member'
                     CHECK(role IN ('admin', 'member')),
-      created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at    TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS projects (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      id          SERIAL PRIMARY KEY,
       name        TEXT    NOT NULL,
       description TEXT,
       created_by  INTEGER NOT NULL REFERENCES users(id),
-      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at  TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS project_members (
@@ -125,7 +114,7 @@ async function initializeDb() {
     );
 
     CREATE TABLE IF NOT EXISTS tasks (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      id          SERIAL PRIMARY KEY,
       project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       title       TEXT    NOT NULL,
       description TEXT,
@@ -133,12 +122,16 @@ async function initializeDb() {
       status      TEXT    NOT NULL DEFAULT 'pending'
                   CHECK(status IN ('pending', 'in_progress', 'completed')),
       due_date    DATE,
-      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at  TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
-  saveToFile();
-  console.log('✅ Database ready at:', DB_PATH);
+  console.log('✅ PostgreSQL database ready.');
 }
 
-module.exports = { getDb, initializeDb };
+function getPool() {
+  if (!pool) throw new Error('DB not ready — initializeDb() must be awaited first.');
+  return pool;
+}
+
+module.exports = { getDb, getPool, initializeDb };

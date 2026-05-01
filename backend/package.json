@@ -1,7 +1,7 @@
 {
   "name": "team-task-manager-backend",
   "version": "1.0.0",
-  "description": "Team Task Manager REST API — Node.js + Express + SQLite",
+  "description": "Team Task Manager REST API — Node.js + Express + PostgreSQL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,7 +16,7 @@
     "express-validator": "^7.0.1",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "sql.js": "^1.12.0"
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

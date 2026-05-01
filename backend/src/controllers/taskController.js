@@ -1,46 +1,41 @@
 const { validationResult } = require('express-validator');
-const { getDb } = require('../config/db');
+const { getDb, getPool } = require('../config/db');
 
 /**
  * GET /api/tasks
- * Query params: projectId, status
- * Admin: sees all tasks (optionally filtered).
- * Member: sees only tasks assigned to them.
+ * Uses getPool() directly for dynamic WHERE clause building with $N params.
  */
-function getTasks(req, res) {
+async function getTasks(req, res) {
   try {
-    const db = getDb();
+    const pool = getPool();
     const { projectId, status } = req.query;
 
-    let query = `
+    const conditions = [];
+    const params = [];
+
+    if (req.user.role !== 'admin') {
+      params.push(req.user.id);
+      conditions.push(`t.assigned_to = $${params.length}`);
+    }
+    if (projectId) {
+      params.push(projectId);
+      conditions.push(`t.project_id = $${params.length}`);
+    }
+    if (status) {
+      params.push(status);
+      conditions.push(`t.status = $${params.length}`);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const { rows } = await pool.query(`
       SELECT t.*, u.name as assignee_name, p.name as project_name
       FROM tasks t
       LEFT JOIN users u ON u.id = t.assigned_to
       LEFT JOIN projects p ON p.id = t.project_id
-      WHERE 1=1
-    `;
-    const params = [];
-
-    // Members only see their own tasks
-    if (req.user.role !== 'admin') {
-      query += ' AND t.assigned_to = ?';
-      params.push(req.user.id);
-    }
-
-    if (projectId) {
-      query += ' AND t.project_id = ?';
-      params.push(projectId);
-    }
-
-    if (status) {
-      query += ' AND t.status = ?';
-      params.push(status);
-    }
-
-    query += ' ORDER BY t.due_date ASC, t.created_at DESC';
-
-    const tasks = db.prepare(query).all(...params);
-    res.json(tasks);
+      ${where}
+      ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC
+    `, params);
+    res.json(rows);
   } catch (err) {
     console.error('[getTasks]', err);
     res.status(500).json({ message: 'Failed to fetch tasks.' });
@@ -49,23 +44,26 @@ function getTasks(req, res) {
 
 /**
  * GET /api/tasks/stats
- * Returns dashboard statistics for the current user.
  */
-function getTaskStats(req, res) {
+async function getTaskStats(req, res) {
   try {
-    const db = getDb();
+    const pool = getPool();
     const today = new Date().toISOString().split('T')[0];
+    const isAdmin = req.user.role === 'admin';
+    const base = isAdmin ? [] : [req.user.id];
+    const w    = isAdmin ? '' : 'WHERE assigned_to = $1';
+    const and  = isAdmin ? 'WHERE' : 'AND';
 
-    let baseWhere = req.user.role === 'admin' ? '1=1' : 'assigned_to = ?';
-    const param = req.user.role === 'admin' ? [] : [req.user.id];
+    const q = (sql, p) => pool.query(sql, p).then(r => Number(r.rows[0].count));
 
-    const total = db.prepare(`SELECT COUNT(*) as count FROM tasks WHERE ${baseWhere}`).get(...param).count;
-    const completed = db.prepare(`SELECT COUNT(*) as count FROM tasks WHERE ${baseWhere} AND status = 'completed'`).get(...param).count;
-    const pending = db.prepare(`SELECT COUNT(*) as count FROM tasks WHERE ${baseWhere} AND status = 'pending'`).get(...param).count;
-    const inProgress = db.prepare(`SELECT COUNT(*) as count FROM tasks WHERE ${baseWhere} AND status = 'in_progress'`).get(...param).count;
-    const overdue = db.prepare(
-      `SELECT COUNT(*) as count FROM tasks WHERE ${baseWhere} AND status != 'completed' AND due_date < ?`
-    ).get(...param, today).count;
+    const [total, completed, pending, inProgress, overdue] = await Promise.all([
+      q(`SELECT COUNT(*) as count FROM tasks ${w}`, base),
+      q(`SELECT COUNT(*) as count FROM tasks ${w} ${w ? 'AND' : 'WHERE'} status='completed'`, base),
+      q(`SELECT COUNT(*) as count FROM tasks ${w} ${w ? 'AND' : 'WHERE'} status='pending'`, base),
+      q(`SELECT COUNT(*) as count FROM tasks ${w} ${w ? 'AND' : 'WHERE'} status='in_progress'`, base),
+      q(`SELECT COUNT(*) as count FROM tasks ${w} ${w ? 'AND' : 'WHERE'} status!='completed' AND due_date < $${base.length + 1}`,
+        [...base, today]),
+    ]);
 
     res.json({ total, completed, pending, inProgress, overdue });
   } catch (err) {
@@ -74,13 +72,11 @@ function getTaskStats(req, res) {
   }
 }
 
-/**
- * GET /api/tasks/:id
- */
-function getTaskById(req, res) {
+/** GET /api/tasks/:id */
+async function getTaskById(req, res) {
   try {
     const db = getDb();
-    const task = db.prepare(`
+    const task = await db.prepare(`
       SELECT t.*, u.name as assignee_name, p.name as project_name
       FROM tasks t
       LEFT JOIN users u ON u.id = t.assigned_to
@@ -89,11 +85,8 @@ function getTaskById(req, res) {
     `).get(req.params.id);
 
     if (!task) return res.status(404).json({ message: 'Task not found.' });
-
-    // Members can only view their own tasks
-    if (req.user.role !== 'admin' && task.assigned_to !== req.user.id) {
+    if (req.user.role !== 'admin' && task.assigned_to !== req.user.id)
       return res.status(403).json({ message: 'Access denied.' });
-    }
 
     res.json(task);
   } catch (err) {
@@ -102,11 +95,8 @@ function getTaskById(req, res) {
   }
 }
 
-/**
- * POST /api/tasks  [Admin only]
- * Creates a new task under a project.
- */
-function createTask(req, res) {
+/** POST /api/tasks  [Admin only] */
+async function createTask(req, res) {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ message: errors.array()[0].msg });
 
@@ -114,20 +104,18 @@ function createTask(req, res) {
   const db = getDb();
 
   try {
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(project_id);
+    const project = await db.prepare('SELECT id FROM projects WHERE id = ?').get(project_id);
     if (!project) return res.status(404).json({ message: 'Project not found.' });
 
-    const result = db.prepare(`
+    const result = await db.prepare(`
       INSERT INTO tasks (project_id, title, description, assigned_to, status, due_date)
-      VALUES (?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?) RETURNING id
     `).run(project_id, title, description || null, assigned_to || null, status || 'pending', due_date || null);
 
-    const task = db.prepare(`
+    const task = await db.prepare(`
       SELECT t.*, u.name as assignee_name, p.name as project_name
-      FROM tasks t
-      LEFT JOIN users u ON u.id = t.assigned_to
-      LEFT JOIN projects p ON p.id = t.project_id
-      WHERE t.id = ?
+      FROM tasks t LEFT JOIN users u ON u.id = t.assigned_to
+      LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = ?
     `).get(result.lastInsertRowid);
 
     res.status(201).json(task);
@@ -137,55 +125,38 @@ function createTask(req, res) {
   }
 }
 
-/**
- * PUT /api/tasks/:id
- * Admin: can update all fields.
- * Member: can only update status of their own assigned task.
- */
-function updateTask(req, res) {
+/** PUT /api/tasks/:id */
+async function updateTask(req, res) {
   const db = getDb();
   try {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
     if (!task) return res.status(404).json({ message: 'Task not found.' });
 
     if (req.user.role === 'member') {
-      // Members can only update status of their own tasks
-      if (task.assigned_to !== req.user.id) {
-        return res.status(403).json({ message: 'Access denied.' });
-      }
+      if (task.assigned_to !== req.user.id) return res.status(403).json({ message: 'Access denied.' });
       const { status } = req.body;
       if (!status) return res.status(400).json({ message: 'Only status can be updated.' });
-      const validStatuses = ['pending', 'in_progress', 'completed'];
-      if (!validStatuses.includes(status)) return res.status(400).json({ message: 'Invalid status.' });
-
-      db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, req.params.id);
+      if (!['pending','in_progress','completed'].includes(status))
+        return res.status(400).json({ message: 'Invalid status.' });
+      await db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run(status, req.params.id);
     } else {
-      // Admin: full update
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ message: errors.array()[0].msg });
-
       const { title, description, assigned_to, status, due_date } = req.body;
-      db.prepare(`
-        UPDATE tasks SET title = ?, description = ?, assigned_to = ?, status = ?, due_date = ?
-        WHERE id = ?
+      await db.prepare(`
+        UPDATE tasks SET title=?, description=?, assigned_to=?, status=?, due_date=? WHERE id=?
       `).run(
-        title ?? task.title,
-        description ?? task.description,
-        assigned_to ?? task.assigned_to,
-        status ?? task.status,
-        due_date ?? task.due_date,
-        req.params.id
+        title ?? task.title, description ?? task.description,
+        assigned_to ?? task.assigned_to, status ?? task.status,
+        due_date ?? task.due_date, req.params.id
       );
     }
 
-    const updated = db.prepare(`
+    const updated = await db.prepare(`
       SELECT t.*, u.name as assignee_name, p.name as project_name
-      FROM tasks t
-      LEFT JOIN users u ON u.id = t.assigned_to
-      LEFT JOIN projects p ON p.id = t.project_id
-      WHERE t.id = ?
+      FROM tasks t LEFT JOIN users u ON u.id = t.assigned_to
+      LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = ?
     `).get(req.params.id);
-
     res.json(updated);
   } catch (err) {
     console.error('[updateTask]', err);
@@ -193,16 +164,13 @@ function updateTask(req, res) {
   }
 }
 
-/**
- * DELETE /api/tasks/:id  [Admin only]
- */
-function deleteTask(req, res) {
+/** DELETE /api/tasks/:id  [Admin only] */
+async function deleteTask(req, res) {
   const db = getDb();
   try {
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.prepare('SELECT id FROM tasks WHERE id = ?').get(req.params.id);
     if (!task) return res.status(404).json({ message: 'Task not found.' });
-
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
+    await db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
     res.json({ message: 'Task deleted successfully.' });
   } catch (err) {
     console.error('[deleteTask]', err);
