@@ -31,7 +31,7 @@ validateRequiredEnv();
 // Initialize database and start server
 initializeDb()
   .then(() => {
-    const server = app.listen(PORT, () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`\n🚀 Team Task Manager API`);
       console.log(`   URL: http://localhost:${PORT}`);
       console.log(`   Environment: ${NODE_ENV}`);
