@@ -4,8 +4,7 @@
   "description": "Team Task Manager — monorepo root for Railway deployment",
   "scripts": {
     "build": "cd frontend && npm install && npm run build",
-    "start": "cd backend && npm install && node server.js",
-    "install-all": "cd backend && npm install && cd ../frontend && npm install"
+    "start": "cd backend && npm install && node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
